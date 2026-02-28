@@ -1,6 +1,5 @@
 """Import service - handles Excel upload, parse, and merge into database."""
 
-import asyncio
 import os
 import shutil
 from decimal import Decimal
@@ -295,27 +294,21 @@ class ImportService:
         return new_count, updated_count, removed_count, changes
 
     def _ensure_fund(self, h) -> None:
-        """Ensure fund exists in funds table, create if not."""
-        from backend.services.nav_fetcher import fetch_fund_type_standalone
+        """Ensure fund exists in funds table, create if not.
 
+        fund_type is left NULL for new funds; it will be backfilled
+        by _backfill_fund_types() during the next NAV refresh.
+        """
         existing = self.db.execute(
             select(Fund).where(Fund.fund_code == h.fund_code)
         ).scalar_one_or_none()
 
         if not existing:
-            # Check if money market fund via API
-            is_money = asyncio.get_event_loop().run_until_complete(
-                fetch_fund_type_standalone(h.fund_code)
-            )
-            fund_type = "货币型" if is_money else None
-            latest_nav = Decimal("1.0000") if is_money else h.nav
-
             fund = Fund(
                 fund_code=h.fund_code,
                 fund_name=h.fund_name,
                 management_company=h.management_company,
-                fund_type=fund_type,
-                latest_nav=latest_nav,
+                latest_nav=h.nav,
                 latest_nav_date=h.nav_date,
             )
             self.db.add(fund)
