@@ -1,0 +1,90 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+env/
+*.whl
+
+# ==========================
+# Environment & Secrets
+# ==========================
+.env
+.env.*
+!.env.example
+alembic.ini
+!alembic.ini.example
+docker-compose.yml
+!docker-compose.yml.example
+
+# ==========================
+# Node / Frontend
+# ==========================
+frontend/node_modules/
+frontend/dist/
+
+# ==========================
+# IDE & Editor
+# ==========================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ==========================
+# OS
+# ==========================
+.DS_Store
+desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# ==========================
+# Data & Uploads
+# ==========================
+data/uploads/
+
+# ==========================
+# Personal Excel files (contain fund holdings with real financial data)
+# ==========================
+*.xlsx
+*.xls
+~$*.xlsx
+
+# ==========================
+# Claude Code local config
+# ==========================
+.claude/
+
+# ==========================
+# Alembic cache
+# ==========================
+alembic/versions/__pycache__/
+
+# ==========================
+# Logs
+# ==========================
+*.log
+logs/
+
+# ==========================
+# Docker (local overrides)
+# ==========================
+docker-compose.override.yml
+
+# ==========================
+# Misc
+# ==========================
+*.bak
+*.tmp
+*.swp
