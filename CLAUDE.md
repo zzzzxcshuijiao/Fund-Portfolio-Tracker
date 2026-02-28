@@ -48,6 +48,7 @@ Models (backend/models/)       -- SQLAlchemy ORM, 7 tables
 - API routers use **lazy imports** for services (function-level `from ... import`) to avoid circular deps
 - SQLAlchemy uses **sync sessions**, but FastAPI endpoints and NAV fetching are `async`
 - Pydantic v2 schemas in `backend/schemas/` with `from_attributes = True`
+- CORS is hardcoded to `http://localhost:3000` in `main.py` -- must edit for non-local deployments
 
 ### Key Data Flows
 
@@ -56,6 +57,8 @@ Models (backend/models/)       -- SQLAlchemy ORM, 7 tables
 2. `excel_parser` parses fixed-format Excel (row 5 = headers, row 6+ = data)
 3. `import_service._merge_holdings()` upserts by unique key `(fund_code, platform, fund_account, trade_account)`
 4. Missing holdings marked `status=0` (cleared), changes recorded in `holding_changes`
+5. `_ensure_fund()` calls East Money API via `asyncio.get_event_loop().run_until_complete()` (sync context bridge -- anti-pattern, potential issue in some async environments)
+6. Money market funds (`ishb=true` from API) get `fund_type="货币型"` and `latest_nav` fixed at `1.0000` permanently
 
 **NAV Refresh** (`POST /api/nav/refresh` or scheduled):
 1. Fetches all active fund codes, batch-calls 东方财富 API (concurrency=5, interval=0.5s)
@@ -82,6 +85,7 @@ Models (backend/models/)       -- SQLAlchemy ORM, 7 tables
 - Axios interceptor auto-unwraps `response.data` and shows `ElMessage.error` on failure
 - 7 views: Dashboard, Holdings, FundDetail, Import, Analysis, Calendar, Settings
 - **Color convention**: red for profit (`#f56c6c`), green for loss (`#67c23a`) -- Chinese market style
+- Calendar endpoints are under `/api/analysis/calendar`, not a separate router
 
 ## Database
 
@@ -96,6 +100,16 @@ Models (backend/models/)       -- SQLAlchemy ORM, 7 tables
 | `import_records` | `id` (PK) |
 | `holding_changes` | `id` (PK) |
 | `holding_daily_pnl` | `(holding_id, pnl_date)` |
+
+### Key Field Values
+
+- `fund_holdings.status`: `1` = active (持有), `0` = cleared (已清仓)
+- `holding_changes.change_type`: `"new"` / `"increase"` / `"decrease"` / `"clear"`
+- `funds.fund_type`: `"货币型"` for money market funds (their `latest_nav` is permanently `1.0000`; East Money returns 万份收益, not unit NAV)
+
+### Market Value Calculation
+
+Dashboard computes real-time market value as `shares * fund.latest_nav` (not stored `holding.market_value`). The stored `market_value` column reflects values at import time.
 
 ### Migration Notes
 
@@ -121,3 +135,6 @@ Models (backend/models/)       -- SQLAlchemy ORM, 7 tables
 - `HoldingsTable.vue` component exists but is unused
 - `pandas` in requirements.txt but never imported
 - Several N+1 query patterns in `nav_service._recalculate_market_values()`, `dashboard_service.get_top_holdings()`, and `snapshot_service._record_holding_daily_pnl()`
+- **[P0 Bug]** Money market fund NAV in `fund_nav_history` is actually 万份收益 (per-10000-shares yield), not unit NAV -- causes wrong daily P&L in calendar view
+- **[P0 Bug]** Daily P&L in calendar vs dashboard are inconsistent (snapshot-based vs real-time NAV-based calculations)
+- **[P0 Bug]** Total market value in dashboard uses `shares * latest_nav` which can diverge from platform's value; Excel-imported `market_value` may be parsed as string type

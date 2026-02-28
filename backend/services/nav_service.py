@@ -11,10 +11,8 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from backend.models.fund import Fund
 from backend.models.holding import FundHolding
 from backend.models.nav_history import FundNavHistory
-from backend.services.nav_fetcher import batch_fetch_nav, NavData, fetch_fund_type
+from backend.services.nav_fetcher import batch_fetch_nav, NavData
 from backend.config import get_settings
-
-import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +29,11 @@ class NavService:
         return list(result)
 
     async def refresh_all_nav(self) -> dict:
-        """Fetch latest NAV for all held funds and update database."""
+        """获取所有持仓基金的最新净值并更新数据库。"""
         settings = get_settings()
         fund_codes = self.get_held_fund_codes()
         if not fund_codes:
             return {"status": "no_holdings", "message": "没有持仓基金"}
-
-        # Build money fund code set and backfill missing fund_type
-        money_fund_codes = self._get_money_fund_codes()
-        await self._backfill_fund_types(fund_codes, money_fund_codes)
 
         results = await batch_fetch_nav(
             fund_codes,
@@ -53,12 +47,11 @@ class NavService:
             if navs and navs[0]:
                 nav = navs[0]
                 self._save_nav(nav)
-                self._update_fund_nav(nav, code in money_fund_codes)
+                self._update_fund_nav(nav)
                 updated += 1
             else:
                 failed += 1
 
-        # Update holding market values
         self._recalculate_market_values()
         self.db.commit()
 
@@ -71,14 +64,11 @@ class NavService:
         }
 
     async def backfill_history(self, days: int = 30) -> dict:
-        """Backfill historical NAV for all held funds."""
+        """回填所有持仓基金的历史净值。"""
         settings = get_settings()
         fund_codes = self.get_held_fund_codes()
         if not fund_codes:
             return {"status": "no_holdings"}
-
-        # Build money fund code set
-        money_fund_codes = self._get_money_fund_codes()
 
         results = await batch_fetch_nav(
             fund_codes,
@@ -92,9 +82,8 @@ class NavService:
             for nav in navs:
                 self._save_nav(nav)
                 total_saved += 1
-            # Also update fund's latest nav
             if navs:
-                self._update_fund_nav(navs[0], code in money_fund_codes)
+                self._update_fund_nav(navs[0])
 
         self._recalculate_market_values()
         self.db.commit()
@@ -121,17 +110,24 @@ class NavService:
         )
         self.db.execute(stmt)
 
-    def _update_fund_nav(self, nav: NavData, is_money_fund: bool = False) -> None:
-        """Update fund's cached latest NAV."""
+    def _update_fund_nav(self, nav: NavData) -> None:
+        """更新 funds 表中的最新净值缓存。
+
+        货币基金特殊处理：
+          - latest_nav 固定为 1.0000（每份面值 1 元）
+          - nav_change_pct = 万份收益 / 10000 * 100，转换为日收益率%
+          - fund_type 同步标记为 "货币型"
+        """
         fund = self.db.execute(
             select(Fund).where(Fund.fund_code == nav.fund_code)
         ).scalar_one_or_none()
         if fund:
             if fund.latest_nav_date is None or nav.nav_date >= fund.latest_nav_date:
-                if is_money_fund:
+                if nav.is_money_fund:
                     fund.latest_nav = Decimal("1.0000")
-                    # nav_change_pct = daily yield rate = DWJZ / 10000 * 100
+                    # 万份收益（元）转日收益率：万份收益 / 10000 * 100
                     fund.nav_change_pct = nav.unit_nav / Decimal("10000") * 100
+                    fund.fund_type = "货币型"
                 else:
                     fund.latest_nav = nav.unit_nav
                     fund.nav_change_pct = nav.change_pct
@@ -162,31 +158,6 @@ class NavService:
             select(Fund.fund_code).where(Fund.fund_type == "货币型")
         ).scalars().all()
         return set(rows)
-
-    async def _backfill_fund_types(
-        self, fund_codes: list[str], money_fund_codes: set[str]
-    ) -> None:
-        """Backfill fund_type for funds where it is NULL."""
-        funds_without_type = self.db.execute(
-            select(Fund).where(
-                Fund.fund_code.in_(fund_codes),
-                Fund.fund_type.is_(None),
-            )
-        ).scalars().all()
-
-        if not funds_without_type:
-            return
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for fund in funds_without_type:
-                is_money = await fetch_fund_type(client, fund.fund_code)
-                if is_money:
-                    fund.fund_type = "货币型"
-                    money_fund_codes.add(fund.fund_code)
-                    logger.info(f"识别货币基金: {fund.fund_code} {fund.fund_name}")
-                else:
-                    fund.fund_type = ""  # Mark as checked (non-money)
-        self.db.flush()
 
     def get_nav_history(self, fund_code: str, days: int = 90) -> list[dict]:
         """Get NAV history for a specific fund."""
