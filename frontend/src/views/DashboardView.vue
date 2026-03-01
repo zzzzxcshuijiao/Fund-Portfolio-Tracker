@@ -75,9 +75,9 @@
       <el-col :span="12">
         <el-card shadow="hover">
           <template #header>
-            <span>近期日收益趋势</span>
+            <span>组合净值走势</span>
           </template>
-          <DailyPnLChart :data="dailyPnlData" />
+          <PortfolioNavChart :data="dailyPnlData" />
         </el-card>
       </el-col>
     </el-row>
@@ -132,7 +132,7 @@ import {
 } from '../api/index.js'
 import AssetSummaryCard from '../components/AssetSummaryCard.vue'
 import PlatformPieChart from '../components/PlatformPieChart.vue'
-import DailyPnLChart from '../components/DailyPnLChart.vue'
+import PortfolioNavChart from '../components/PortfolioNavChart.vue'
 
 const summary = ref({
   total_market_value: 0,
@@ -161,7 +161,7 @@ async function loadDashboard() {
     const [summaryRes, platformRes, pnlRes, holdingsRes] = await Promise.allSettled([
       getSummary(),
       getPlatformDistribution(),
-      getDailyPnl({ days: 30 }),
+      getDailyPnl({ days: 90 }),
       getTopHoldings({ limit: 10 }),
     ])
 

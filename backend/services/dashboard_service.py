@@ -129,6 +129,8 @@ class DashboardService:
                 total_market_value=s.total_market_value,
                 daily_pnl=s.daily_pnl,
                 daily_pnl_pct=s.daily_pnl_pct,
+                portfolio_nav=s.portfolio_nav,
+                cumulative_return_pct=(s.portfolio_nav - 1) * 100 if s.portfolio_nav is not None else None,
             )
             for s in snapshots
         ]

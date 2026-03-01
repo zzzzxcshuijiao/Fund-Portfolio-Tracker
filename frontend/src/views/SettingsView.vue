@@ -23,6 +23,27 @@
         </span>
       </div>
 
+      <div class="manual-section">
+        <el-button
+          type="success"
+          :loading="snapshotting"
+          @click="handleCreateSnapshot"
+          size="large"
+        >
+          生成今日快照
+        </el-button>
+        <span class="status-text">记录当前资产总值，建议刷新净值后执行</span>
+      </div>
+
+      <el-alert
+        v-if="snapshotResult"
+        :title="`快照已生成：${snapshotResult.snapshot_date}，总资产 ￥${Number(snapshotResult.total_market_value).toLocaleString('zh-CN', {minimumFractionDigits: 2})}`"
+        type="success"
+        show-icon
+        closable
+        style="margin-top: 16px"
+      />
+
       <!-- Refresh Result -->
       <el-alert
         v-if="refreshResult"
@@ -54,6 +75,79 @@
       </div>
     </el-card>
 
+    <!-- Data Maintenance -->
+    <el-card shadow="hover" class="settings-card">
+      <template #header>
+        <span>数据维护</span>
+      </template>
+
+      <el-alert type="info" :closable="false" style="margin-bottom: 16px">
+        <template #title>初次使用建议按顺序执行：① 回填历史净值 → ② 从导入记录回填历史快照</template>
+      </el-alert>
+
+      <div class="manual-section">
+        <el-button
+          type="primary"
+          plain
+          :loading="navHistoryBackfilling"
+          @click="handleBackfillNavHistory"
+          size="large"
+        >
+          ① 回填历史净值数据
+        </el-button>
+        <span class="status-text">从东方财富拉取自首次导入以来的全量历史净值（约需 1-3 分钟）</span>
+      </div>
+      <el-alert
+        v-if="navHistoryResult"
+        :title="`历史净值回填完成：${navHistoryResult.funds} 只基金，共 ${navHistoryResult.nav_records} 条记录，起始日期 ${navHistoryResult.start_date}`"
+        type="success"
+        show-icon
+        closable
+        style="margin-top: 8px; margin-bottom: 8px"
+      />
+
+      <div class="manual-section">
+        <el-button
+          type="danger"
+          plain
+          :loading="historicalBackfilling"
+          @click="handleHistoricalBackfill"
+          size="large"
+        >
+          ② 从导入记录回填历史快照
+        </el-button>
+        <span class="status-text">为每次导入日期创建快照，市值来自导入的持仓数据</span>
+      </div>
+      <el-alert
+        v-if="historicalBackfillResult"
+        :title="`历史快照回填完成，新增 ${historicalBackfillResult.created} 条记录`"
+        type="success"
+        show-icon
+        closable
+        style="margin-top: 8px; margin-bottom: 8px"
+      />
+
+      <div class="manual-section">
+        <el-button
+          type="warning"
+          :loading="backfilling"
+          @click="handleBackfillNav"
+          size="large"
+        >
+          重算组合净值
+        </el-button>
+        <span class="status-text">重新计算所有历史快照的组合净值（回填快照后执行）</span>
+      </div>
+      <el-alert
+        v-if="backfillDone"
+        title="回填完成，请刷新仪表盘查看组合净值走势"
+        type="success"
+        show-icon
+        closable
+        style="margin-top: 16px"
+      />
+    </el-card>
+
     <!-- Schedule Info -->
     <el-card shadow="hover" class="settings-card">
       <template #header>
@@ -81,11 +175,19 @@
 import { ref, onMounted } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { refreshNav, getNavStatus } from '../api/index.js'
+import { refreshNav, getNavStatus, backfillPortfolioNav, createSnapshot, backfillSnapshots, backfillNavHistory } from '../api/index.js'
 
 const refreshing = ref(false)
 const refreshResult = ref(null)
 const navStatus = ref({})
+const backfilling = ref(false)
+const backfillDone = ref(false)
+const snapshotting = ref(false)
+const snapshotResult = ref(null)
+const historicalBackfilling = ref(false)
+const historicalBackfillResult = ref(null)
+const navHistoryBackfilling = ref(false)
+const navHistoryResult = ref(null)
 
 async function handleRefreshNav() {
   refreshing.value = true
@@ -106,6 +208,60 @@ async function loadStatus() {
     navStatus.value = await getNavStatus()
   } catch {
     // Errors handled by interceptor
+  }
+}
+
+async function handleBackfillNav() {
+  backfilling.value = true
+  backfillDone.value = false
+  try {
+    await backfillPortfolioNav()
+    backfillDone.value = true
+    ElMessage.success('组合净值回填完成')
+  } catch {
+    // Errors handled by interceptor
+  } finally {
+    backfilling.value = false
+  }
+}
+
+async function handleCreateSnapshot() {
+  snapshotting.value = true
+  snapshotResult.value = null
+  try {
+    snapshotResult.value = await createSnapshot()
+    ElMessage.success(`快照已生成：${snapshotResult.value.snapshot_date}`)
+  } catch {
+    // Errors handled by interceptor
+  } finally {
+    snapshotting.value = false
+  }
+}
+
+async function handleBackfillNavHistory() {
+  navHistoryBackfilling.value = true
+  navHistoryResult.value = null
+  try {
+    navHistoryResult.value = await backfillNavHistory()
+    ElMessage.success(`历史净值回填完成：${navHistoryResult.value.nav_records} 条记录`)
+    loadStatus()
+  } catch {
+    // Errors handled by interceptor
+  } finally {
+    navHistoryBackfilling.value = false
+  }
+}
+
+async function handleHistoricalBackfill() {
+  historicalBackfilling.value = true
+  historicalBackfillResult.value = null
+  try {
+    historicalBackfillResult.value = await backfillSnapshots()
+    ElMessage.success(`历史快照回填完成，新增 ${historicalBackfillResult.value.created} 条`)
+  } catch {
+    // Errors handled by interceptor
+  } finally {
+    historicalBackfilling.value = false
   }
 }
 

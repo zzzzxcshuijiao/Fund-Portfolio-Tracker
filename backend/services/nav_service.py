@@ -64,17 +64,29 @@ class NavService:
         }
 
     async def backfill_history(self, days: int = 30) -> dict:
-        """回填所有持仓基金的历史净值。"""
+        """回填所有持仓基金的历史净值，从第一次导入日期开始。"""
         settings = get_settings()
         fund_codes = self.get_held_fund_codes()
         if not fund_codes:
             return {"status": "no_holdings"}
 
+        # Use first import date as start, so we get exactly the data needed
+        from backend.models.import_record import ImportRecord
+        first_import_date = self.db.execute(
+            select(func.min(ImportRecord.data_date))
+            .where(ImportRecord.data_date.isnot(None))
+        ).scalar()
+
+        start_date = str(first_import_date) if first_import_date else None
+        # page_size large enough to cover all trading days since start_date
+        page_size = max(days, 300)
+
         results = await batch_fetch_nav(
             fund_codes,
             concurrency=settings.NAV_FETCH_CONCURRENCY,
             interval=settings.NAV_FETCH_INTERVAL,
-            history_days=days,
+            history_days=page_size,
+            start_date=start_date,
         )
 
         total_saved = 0
@@ -92,6 +104,7 @@ class NavService:
             "status": "success",
             "funds": len(fund_codes),
             "nav_records": total_saved,
+            "start_date": start_date,
         }
 
     def _save_nav(self, nav: NavData) -> None:

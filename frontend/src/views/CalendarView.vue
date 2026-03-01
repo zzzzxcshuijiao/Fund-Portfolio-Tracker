@@ -14,6 +14,12 @@
           </div>
           <div v-else-if="data" class="summary-body">
             <div class="summary-item">
+              <span class="summary-label">月末资产</span>
+              <span class="summary-value">
+                {{ monthEndMv != null ? '¥' + formatNum(monthEndMv) : '-' }}
+              </span>
+            </div>
+            <div class="summary-item">
               <span class="summary-label">月累计盈亏</span>
               <span class="summary-value" :class="pnlClass(data.summary.total_pnl)">
                 {{ formatMoney(data.summary.total_pnl) }}
@@ -74,6 +80,7 @@
             >
               <template v-if="cell.day">
                 <div class="day-number">{{ cell.day }}</div>
+                <div v-if="cell.mv !== null" class="day-mv">{{ formatMv(cell.mv) }}</div>
                 <div v-if="cell.pnl !== null" class="day-pnl" :class="pnlClass(cell.pnl)">
                   {{ formatCompact(cell.pnl) }}
                 </div>
@@ -163,6 +170,14 @@ const pnlMap = computed(() => {
   return map
 })
 
+// Last trading day's market value in this month
+const monthEndMv = computed(() => {
+  if (!data.value?.daily_data?.length) return null
+  const sorted = [...data.value.daily_data].filter(d => d.market_value != null)
+  if (!sorted.length) return null
+  return Number(sorted[sorted.length - 1].market_value)
+})
+
 // Generate calendar cells (6 rows x 7 cols)
 const calendarCells = computed(() => {
   const cells = []
@@ -175,7 +190,7 @@ const calendarCells = computed(() => {
 
   // Leading empty cells
   for (let i = 0; i < startWeekday; i++) {
-    cells.push({ day: null, pnl: null, pnlPct: null, dateStr: null })
+    cells.push({ day: null, pnl: null, pnlPct: null, mv: null, dateStr: null })
   }
 
   // Day cells
@@ -189,13 +204,14 @@ const calendarCells = computed(() => {
       dateStr,
       pnl: dayData?.daily_pnl != null ? Number(dayData.daily_pnl) : null,
       pnlPct: dayData?.daily_pnl_pct != null ? Number(dayData.daily_pnl_pct) : null,
+      mv: dayData?.market_value != null ? Number(dayData.market_value) : null,
       isTrading: !!dayData,
     })
   }
 
   // Trailing empty cells to fill the grid
   while (cells.length % 7 !== 0) {
-    cells.push({ day: null, pnl: null, pnlPct: null, dateStr: null })
+    cells.push({ day: null, pnl: null, pnlPct: null, mv: null, dateStr: null })
   }
 
   return cells
@@ -305,6 +321,14 @@ function formatCompact(val) {
   return prefix + n.toFixed(0)
 }
 
+// Format market value compactly for calendar cells (e.g. ¥45.8万)
+function formatMv(val) {
+  if (val == null) return ''
+  const n = Number(val)
+  if (n >= 10000) return '¥' + (n / 10000).toFixed(1) + '万'
+  return '¥' + n.toFixed(0)
+}
+
 function formatNum(val) {
   if (val == null) return '-'
   return Number(val).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
@@ -401,7 +425,7 @@ function formatNum(val) {
 }
 
 .day-cell {
-  min-height: 70px;
+  min-height: 76px;
   padding: 6px;
   border-radius: 6px;
   cursor: default;
@@ -446,11 +470,17 @@ function formatNum(val) {
   font-size: 14px;
   font-weight: 500;
   color: #303133;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
+}
+
+.day-mv {
+  font-size: 11px;
+  color: #909399;
+  margin-bottom: 1px;
 }
 
 .day-pnl {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
 }
 

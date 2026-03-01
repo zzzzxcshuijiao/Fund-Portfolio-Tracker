@@ -37,3 +37,11 @@ def get_daily_pnl(days: int = Query(30, ge=1, le=365), db: Session = Depends(get
 def get_top_holdings(limit: int = Query(10, ge=1, le=50), db: Session = Depends(get_db)):
     """Get top N holdings by market value."""
     return DashboardService(db).get_top_holdings(limit)
+
+
+@router.post("/backfill-portfolio-nav")
+def backfill_portfolio_nav(db: Session = Depends(get_db)):
+    """Backfill portfolio NAV for all existing snapshots."""
+    from backend.services.snapshot_service import SnapshotService
+    SnapshotService(db).backfill_portfolio_nav()
+    return {"status": "ok"}

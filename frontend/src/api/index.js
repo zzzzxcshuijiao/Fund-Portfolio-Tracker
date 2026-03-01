@@ -41,6 +41,10 @@ export function getTopHoldings(params) {
   return api.get('/dashboard/top-holdings', { params })
 }
 
+export function backfillPortfolioNav() {
+  return api.post('/dashboard/backfill-portfolio-nav')
+}
+
 // ---- Holdings APIs ----
 
 export function getHoldings(params) {
@@ -96,6 +100,18 @@ export function refreshNav() {
 
 export function getNavStatus() {
   return api.get('/nav/status')
+}
+
+export function createSnapshot() {
+  return api.post('/nav/snapshot')
+}
+
+export function backfillNavHistory() {
+  return api.post('/nav/backfill-history', null, { timeout: 300000 })
+}
+
+export function backfillSnapshots() {
+  return api.post('/nav/backfill-snapshots')
 }
 
 // ---- Analysis APIs ----

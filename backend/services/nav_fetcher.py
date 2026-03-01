@@ -140,35 +140,54 @@ async def fetch_latest_nav(
 
 
 async def fetch_history_nav(
-    client: httpx.AsyncClient, fund_code: str, page_size: int = 30
+    client: httpx.AsyncClient,
+    fund_code: str,
+    page_size: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> list[NavData]:
-    """获取单只基金的历史净值列表。"""
-    params = {
-        "fundCode": fund_code,
-        "pageIndex": 1,
-        "pageSize": page_size,
-    }
-    try:
-        resp = await client.get(
-            HISTORY_NAV_URL, params=params, headers=_random_headers()
-        )
-        resp.raise_for_status()
-        logger.debug("[东财API] fetch_history_nav %s 原始响应: %s", fund_code, resp.text[:500])
-        data = _parse_jsonp(resp.text)
+    """获取单只基金的历史净值列表，自动翻页直到取完所有数据。"""
+    PAGE_SIZE = 20  # API hard limit per page
+    results: list[NavData] = []
+    page = 1
+    total_count = None
 
-        # SYType 是基金级别属性，列表内所有条目共用同一判断
+    while True:
+        params: dict = {
+            "fundCode": fund_code,
+            "pageIndex": page,
+            "pageSize": PAGE_SIZE,
+        }
+        if start_date:
+            params["startDate"] = start_date
+        if end_date:
+            params["endDate"] = end_date
+
+        try:
+            resp = await client.get(
+                HISTORY_NAV_URL, params=params, headers=_random_headers()
+            )
+            resp.raise_for_status()
+            data = _parse_jsonp(resp.text)
+        except Exception:
+            break
+
+        if data is None:
+            break
+
+        if total_count is None:
+            total_count = data.get("TotalCount", 0)
+
         is_money_fund = _is_money_fund_by_sy_type(data)
+        items = (data.get("Data") or {}).get("LSJZList", [])
 
-        items = data.get("Data", {}).get("LSJZList", [])
-        results = []
+        if not items:
+            break
+
         for item in items:
-            # FSRQ: 净值日期
             nav_date_str = item.get("FSRQ", "")
-            # DWJZ: 单位净值（货币基金为万份收益）
             unit_nav_str = item.get("DWJZ", "")
-            # LJJZ: 累计净值
             acc_nav_str = item.get("LJJZ", "")
-            # JZZZL: 日涨跌幅%
             change_pct_str = item.get("JZZZL", "")
 
             try:
@@ -199,9 +218,15 @@ async def fetch_history_nav(
                 change_pct=change_pct,
                 is_money_fund=is_money_fund,
             ))
-        return results
-    except Exception:
-        return []
+
+        # Stop when we've fetched everything
+        if total_count and len(results) >= total_count:
+            break
+
+        page += 1
+        await asyncio.sleep(0.1)  # small delay between pages of same fund
+
+    return results
 
 
 async def batch_fetch_nav(
@@ -209,6 +234,8 @@ async def batch_fetch_nav(
     concurrency: int = 5,
     interval: float = 0.5,
     history_days: int = 0,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> dict[str, list[NavData]]:
     """批量抓取多只基金净值，带限速。
 
@@ -216,7 +243,9 @@ async def batch_fetch_nav(
         fund_codes: 基金代码列表
         concurrency: 最大并发请求数
         interval: 每次请求间隔秒数
-        history_days: >0 时抓取历史净值，否则只取最新一条
+        history_days: >0 时抓取历史净值（page_size），否则只取最新一条
+        start_date: 历史净值起始日期 YYYY-MM-DD（与 history_days 搭配使用）
+        end_date: 历史净值结束日期 YYYY-MM-DD
 
     Returns:
         fund_code -> [NavData] 的字典
@@ -228,8 +257,11 @@ async def batch_fetch_nav(
 
         async def _fetch_one(code: str):
             async with semaphore:
-                if history_days > 0:
-                    navs = await fetch_history_nav(client, code, history_days)
+                if history_days > 0 or start_date:
+                    navs = await fetch_history_nav(
+                        client, code,
+                        start_date=start_date, end_date=end_date,
+                    )
                     results[code] = navs
                 else:
                     nav = await fetch_latest_nav(client, code)

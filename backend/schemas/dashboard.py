@@ -29,6 +29,8 @@ class DailyPnLPoint(BaseModel):
     total_market_value: Decimal
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
+    portfolio_nav: Optional[Decimal] = None
+    cumulative_return_pct: Optional[Decimal] = None
 
 
 class TopHolding(BaseModel):
