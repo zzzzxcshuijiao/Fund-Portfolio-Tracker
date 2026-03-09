@@ -114,6 +114,10 @@ export function backfillSnapshots() {
   return api.post('/nav/backfill-snapshots')
 }
 
+export function backfillHoldingPnl() {
+  return api.post('/nav/backfill-holding-pnl', null, { timeout: 600000 })
+}
+
 // ---- Analysis APIs ----
 
 export function getAnalysisPeriods() {

@@ -82,7 +82,7 @@
       </template>
 
       <el-alert type="info" :closable="false" style="margin-bottom: 16px">
-        <template #title>初次使用建议按顺序执行：① 回填历史净值 → ② 从导入记录回填历史快照</template>
+        <template #title>初次使用建议按顺序执行：① 回填历史净值 → ② 从导入记录回填历史快照 → ③ 补全持仓每日盈亏</template>
       </el-alert>
 
       <div class="manual-section">
@@ -121,6 +121,27 @@
       <el-alert
         v-if="historicalBackfillResult"
         :title="`历史快照回填完成，新增 ${historicalBackfillResult.created} 条记录`"
+        type="success"
+        show-icon
+        closable
+        style="margin-top: 8px; margin-bottom: 8px"
+      />
+
+      <div class="manual-section">
+        <el-button
+          type="primary"
+          plain
+          :loading="holdingPnlBackfilling"
+          @click="handleBackfillHoldingPnl"
+          size="large"
+        >
+          ③ 补全持仓每日盈亏
+        </el-button>
+        <span class="status-text">根据历史净值重新生成每只持仓的每日盈亏记录（回填历史净值后执行）</span>
+      </div>
+      <el-alert
+        v-if="holdingPnlResult"
+        :title="`持仓每日盈亏补全完成，共处理 ${holdingPnlResult.dates_processed} 个交易日`"
         type="success"
         show-icon
         closable
@@ -175,7 +196,7 @@
 import { ref, onMounted } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { refreshNav, getNavStatus, backfillPortfolioNav, createSnapshot, backfillSnapshots, backfillNavHistory } from '../api/index.js'
+import { refreshNav, getNavStatus, backfillPortfolioNav, createSnapshot, backfillSnapshots, backfillNavHistory, backfillHoldingPnl } from '../api/index.js'
 
 const refreshing = ref(false)
 const refreshResult = ref(null)
@@ -188,6 +209,8 @@ const historicalBackfilling = ref(false)
 const historicalBackfillResult = ref(null)
 const navHistoryBackfilling = ref(false)
 const navHistoryResult = ref(null)
+const holdingPnlBackfilling = ref(false)
+const holdingPnlResult = ref(null)
 
 async function handleRefreshNav() {
   refreshing.value = true
@@ -262,6 +285,19 @@ async function handleHistoricalBackfill() {
     // Errors handled by interceptor
   } finally {
     historicalBackfilling.value = false
+  }
+}
+
+async function handleBackfillHoldingPnl() {
+  holdingPnlBackfilling.value = true
+  holdingPnlResult.value = null
+  try {
+    holdingPnlResult.value = await backfillHoldingPnl()
+    ElMessage.success(`持仓每日盈亏补全完成，处理了 ${holdingPnlResult.value.dates_processed} 个交易日`)
+  } catch {
+    // Errors handled by interceptor
+  } finally {
+    holdingPnlBackfilling.value = false
   }
 }
 

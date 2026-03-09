@@ -269,6 +269,101 @@ class SnapshotService:
 
         return created
 
+    def backfill_all_daily_snapshots(self) -> int:
+        """为 fund_nav_history 中所有 nav_date 创建或更新 portfolio_snapshots。
+
+        使用 shares × unit_nav 计算历史市值（而非 mv_after），保证计算方式与实时快照一致。
+        货币型基金市值 = shares × 1.0（不使用 fund_nav_history.unit_nav，因其为万份收益）。
+        对已有快照则更新其 total_market_value 和 total_shares_count，
+        最后调用 _recompute_daily_pnl_and_nav() 重算 daily_pnl 和 portfolio_nav。
+        返回创建或更新的快照数量。
+        """
+        db = self.db
+
+        # 取 fund_nav_history 中所有交易日
+        nav_dates = db.execute(
+            select(FundNavHistory.nav_date)
+            .distinct()
+            .order_by(FundNavHistory.nav_date.asc())
+        ).scalars().all()
+
+        if not nav_dates:
+            return 0
+
+        money_fund_codes = self._get_money_fund_codes()
+        created_or_updated = 0
+
+        for nav_date in nav_dates:
+            # 获取该日各基金历史份额 {fund_code: total_shares}
+            shares_map = self._get_shares_map_on_date(nav_date)
+            if not shares_map:
+                continue
+
+            # 非货币型基金查历史净值（最近 nav_date <= nav_date）
+            non_money_codes = [fc for fc in shares_map if fc not in money_fund_codes]
+            nav_map: dict[str, Decimal] = {}
+            if non_money_codes:
+                nav_subq = (
+                    select(
+                        FundNavHistory.fund_code,
+                        func.max(FundNavHistory.nav_date).label("latest_date"),
+                    )
+                    .where(
+                        FundNavHistory.fund_code.in_(non_money_codes),
+                        FundNavHistory.nav_date <= nav_date,
+                    )
+                    .group_by(FundNavHistory.fund_code)
+                    .subquery()
+                )
+                nav_rows = db.execute(
+                    select(FundNavHistory.fund_code, FundNavHistory.unit_nav)
+                    .join(
+                        nav_subq,
+                        (FundNavHistory.fund_code == nav_subq.c.fund_code)
+                        & (FundNavHistory.nav_date == nav_subq.c.latest_date),
+                    )
+                ).all()
+                nav_map = {r.fund_code: r.unit_nav for r in nav_rows}
+
+            # 计算总市值
+            total_mv = Decimal("0")
+            active_count = 0
+            for fund_code, shares in shares_map.items():
+                if fund_code in money_fund_codes:
+                    total_mv += shares  # 货币型：1份 = 1元
+                    active_count += 1
+                elif fund_code in nav_map:
+                    total_mv += shares * nav_map[fund_code]
+                    active_count += 1
+                # 无净值数据的基金跳过
+
+            if total_mv == Decimal("0"):
+                continue
+
+            existing = db.execute(
+                select(PortfolioSnapshot)
+                .where(PortfolioSnapshot.snapshot_date == nav_date)
+            ).scalar_one_or_none()
+
+            if existing:
+                existing.total_market_value = total_mv
+                existing.total_shares_count = active_count
+            else:
+                db.add(PortfolioSnapshot(
+                    snapshot_date=nav_date,
+                    total_market_value=total_mv,
+                    total_shares_count=active_count,
+                ))
+
+            created_or_updated += 1
+
+        db.commit()
+
+        # 重算所有快照的 daily_pnl、daily_pnl_pct 和 portfolio_nav
+        self._recompute_daily_pnl_and_nav()
+
+        return created_or_updated
+
     def _recompute_daily_pnl_and_nav(self) -> None:
         """Recompute daily_pnl, daily_pnl_pct and portfolio_nav for all snapshots."""
         snapshots = self.db.execute(
@@ -307,35 +402,83 @@ class SnapshotService:
         self.db.commit()
 
     def _record_holding_daily_pnl(self, snapshot_date: date) -> None:
-        """Record daily PnL for each active holding."""
-        # Get money fund codes
+        """Record daily PnL for each holding, using historical shares on snapshot_date.
+
+        Uses holding_changes to reconstruct shares held on the given date,
+        which fixes incorrect P&L when shares have changed since the historical date.
+        Includes cleared holdings (status=0) that may have been active historically.
+        """
         money_fund_codes = self._get_money_fund_codes()
 
-        # Get all active holdings with fund info
-        rows = self.db.execute(
-            select(FundHolding, Fund)
-            .outerjoin(Fund, FundHolding.fund_code == Fund.fund_code)
-            .where(FundHolding.status == 1)
+        # 对每个 holding 找 data_date <= snapshot_date 范围内最近一次变更（按 import_id 最大）
+        subq = (
+            select(
+                HoldingChange.holding_id,
+                func.max(HoldingChange.import_id).label("last_import_id"),
+            )
+            .join(ImportRecord, HoldingChange.import_id == ImportRecord.id)
+            .where(
+                ImportRecord.data_date <= snapshot_date,
+                HoldingChange.holding_id.isnot(None),
+            )
+            .group_by(HoldingChange.holding_id)
+            .subquery()
+        )
+
+        hist_rows = self.db.execute(
+            select(
+                FundHolding.id,
+                FundHolding.fund_code,
+                HoldingChange.shares_after,
+                HoldingChange.change_type,
+            )
+            .join(subq, FundHolding.id == subq.c.holding_id)
+            .join(
+                HoldingChange,
+                (HoldingChange.holding_id == subq.c.holding_id)
+                & (HoldingChange.import_id == subq.c.last_import_id),
+            )
         ).all()
 
-        for holding, fund in rows:
-            if not fund or not fund.latest_nav or not holding.shares:
+        # {holding_id: (fund_code, shares)} for holdings active on snapshot_date
+        active_holdings: dict[int, tuple[str, Decimal]] = {}
+        for holding_id, fund_code, shares_after, change_type in hist_rows:
+            if change_type == "clear" or shares_after is None:
                 continue
+            s = Decimal(str(shares_after))
+            if s > Decimal("0"):
+                active_holdings[holding_id] = (fund_code, s)
 
-            shares = holding.shares
-            is_money = holding.fund_code in money_fund_codes
+        if not active_holdings:
+            return
+
+        # Prefetch fund.latest_nav for fallback when nav_history has no data
+        all_fund_codes = {fc for _, (fc, _) in active_holdings.items()}
+        fund_nav_fallback: dict[str, Decimal] = {}
+        fund_rows = self.db.execute(
+            select(Fund.fund_code, Fund.latest_nav)
+            .where(Fund.fund_code.in_(all_fund_codes))
+        ).all()
+        for r in fund_rows:
+            if r.latest_nav:
+                fund_nav_fallback[r.fund_code] = r.latest_nav
+
+        for holding_id, (fund_code, shares) in active_holdings.items():
+            is_money = fund_code in money_fund_codes
 
             if is_money:
-                nav = fund.latest_nav  # 1.0000 for money funds
+                nav = Decimal("1.0000")
                 mv = shares  # each share = 1 yuan
 
-                # Get today's DWJZ (万份收益) from nav_history
+                # Get the most recent DWJZ (万份收益) on or before snapshot_date.
                 today_dwjz = self.db.execute(
                     select(FundNavHistory.unit_nav)
                     .where(
-                        FundNavHistory.fund_code == holding.fund_code,
-                        FundNavHistory.nav_date == snapshot_date,
+                        FundNavHistory.fund_code == fund_code,
+                        FundNavHistory.nav_date <= snapshot_date,
                     )
+                    .order_by(FundNavHistory.nav_date.desc())
+                    .limit(1)
                 ).scalar_one_or_none()
 
                 if today_dwjz:
@@ -346,21 +489,39 @@ class SnapshotService:
                     pnl_pct = None
                 prev_nav = None
             else:
-                nav = fund.latest_nav
+                today_nav_row = self.db.execute(
+                    select(FundNavHistory.unit_nav, FundNavHistory.nav_date)
+                    .where(
+                        FundNavHistory.fund_code == fund_code,
+                        FundNavHistory.nav_date <= snapshot_date,
+                    )
+                    .order_by(FundNavHistory.nav_date.desc())
+                    .limit(1)
+                ).first()
+
+                if today_nav_row:
+                    nav = today_nav_row.unit_nav
+                    current_nav_date = today_nav_row.nav_date
+                elif fund_code in fund_nav_fallback:
+                    nav = fund_nav_fallback[fund_code]
+                    current_nav_date = snapshot_date
+                else:
+                    continue  # No NAV data available for this fund, skip
+
                 mv = shares * nav
 
-                # Get previous NAV from fund_nav_history
+                # Get previous NAV strictly before current_nav_date
                 prev_nav_row = self.db.execute(
                     select(FundNavHistory.unit_nav)
                     .where(
-                        FundNavHistory.fund_code == holding.fund_code,
-                        FundNavHistory.nav_date < snapshot_date,
+                        FundNavHistory.fund_code == fund_code,
+                        FundNavHistory.nav_date < current_nav_date,
                     )
                     .order_by(FundNavHistory.nav_date.desc())
                     .limit(1)
                 ).scalar_one_or_none()
 
-                prev_nav = prev_nav_row if prev_nav_row else None
+                prev_nav = prev_nav_row
                 pnl = None
                 pnl_pct = None
                 if prev_nav and prev_nav > 0:
@@ -370,13 +531,13 @@ class SnapshotService:
             # Upsert: check if record exists
             existing = self.db.execute(
                 select(HoldingDailyPnL).where(
-                    HoldingDailyPnL.holding_id == holding.id,
+                    HoldingDailyPnL.holding_id == holding_id,
                     HoldingDailyPnL.pnl_date == snapshot_date,
                 )
             ).scalar_one_or_none()
 
             if existing:
-                existing.fund_code = holding.fund_code
+                existing.fund_code = fund_code
                 existing.shares = shares
                 existing.nav = nav
                 existing.prev_nav = prev_nav
@@ -386,8 +547,8 @@ class SnapshotService:
             else:
                 record = HoldingDailyPnL(
                     pnl_date=snapshot_date,
-                    holding_id=holding.id,
-                    fund_code=holding.fund_code,
+                    holding_id=holding_id,
+                    fund_code=fund_code,
                     shares=shares,
                     nav=nav,
                     prev_nav=prev_nav,
@@ -399,9 +560,75 @@ class SnapshotService:
 
         self.db.commit()
 
+    def backfill_holding_daily_pnl(self) -> int:
+        """Backfill holding_daily_pnl for all dates that have NAV data in fund_nav_history.
+
+        Iterates over every distinct nav_date in fund_nav_history and calls
+        _record_holding_daily_pnl for each one. Existing records are updated in place.
+        Returns the number of dates processed.
+        """
+        nav_dates = self.db.execute(
+            select(FundNavHistory.nav_date)
+            .distinct()
+            .order_by(FundNavHistory.nav_date.asc())
+        ).scalars().all()
+
+        for pnl_date in nav_dates:
+            self._record_holding_daily_pnl(pnl_date)
+
+        return len(nav_dates)
+
     def _get_money_fund_codes(self) -> set[str]:
         """Get set of fund codes that are money market funds."""
         rows = self.db.execute(
             select(Fund.fund_code).where(Fund.fund_type == "货币型")
         ).scalars().all()
         return set(rows)
+
+    def _get_shares_map_on_date(self, target_date: date) -> dict[str, Decimal]:
+        """返回 {fund_code: total_shares}，表示 target_date 当日每个基金的持仓份额。
+
+        通过查询 holding_changes + import_records，找到每个持仓在 target_date
+        之前最近一次导入后的 shares_after。同一 fund_code 的多个持仓（不同平台/账户）
+        份额累加合并。change_type == "clear" 或无记录的持仓份额视为 0。
+        """
+        db = self.db
+
+        # 对每个 holding，找 data_date <= target_date 范围内 import_id 最大的那次变更
+        subq = (
+            select(
+                HoldingChange.holding_id,
+                func.max(HoldingChange.import_id).label("last_import_id"),
+            )
+            .join(ImportRecord, HoldingChange.import_id == ImportRecord.id)
+            .where(
+                ImportRecord.data_date <= target_date,
+                HoldingChange.holding_id.isnot(None),
+            )
+            .group_by(HoldingChange.holding_id)
+            .subquery()
+        )
+
+        rows = db.execute(
+            select(
+                FundHolding.fund_code,
+                HoldingChange.shares_after,
+                HoldingChange.change_type,
+            )
+            .join(subq, FundHolding.id == subq.c.holding_id)
+            .join(
+                HoldingChange,
+                (HoldingChange.holding_id == subq.c.holding_id)
+                & (HoldingChange.import_id == subq.c.last_import_id),
+            )
+        ).all()
+
+        shares_map: dict[str, Decimal] = {}
+        for fund_code, shares_after, change_type in rows:
+            if change_type == "clear" or shares_after is None:
+                continue
+            s = Decimal(str(shares_after))
+            if s > Decimal("0"):
+                shares_map[fund_code] = shares_map.get(fund_code, Decimal("0")) + s
+
+        return shares_map

@@ -1,6 +1,11 @@
 <template>
   <div class="dashboard-view">
-    <h2 class="page-title">投资概览</h2>
+    <div class="page-header">
+      <h2 class="page-title">投资概览</h2>
+      <span v-if="summary.nav_update_time" class="data-date">
+        数据日期：{{ summary.nav_update_time }}
+      </span>
+    </div>
 
     <!-- Summary Cards -->
     <el-row :gutter="20" class="summary-row">
@@ -141,6 +146,7 @@ const summary = ref({
   total_holdings: 0,
   total_funds: 0,
   total_platforms: 0,
+  nav_update_time: null,
 })
 const platformData = ref([])
 const dailyPnlData = ref([])
@@ -184,11 +190,23 @@ onMounted(() => {
   padding: 4px;
 }
 
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
 .page-title {
-  margin: 0 0 20px 0;
+  margin: 0;
   font-size: 22px;
   font-weight: 600;
   color: #303133;
+}
+
+.data-date {
+  font-size: 14px;
+  color: #909399;
 }
 
 .summary-row {

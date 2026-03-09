@@ -43,9 +43,11 @@ class DashboardService:
                 mv = holding.market_value or Decimal("0")
             total_mv += mv
 
-            # Calculate daily PnL: market_value * change_pct / 100
+            # Calculate daily PnL: shares × (today_nav - prev_nav)
+            # nav_change_pct = (today - prev) / prev × 100，反推：
+            # delta = today_nav × nav_change_pct / (100 + nav_change_pct)
             if fund and fund.nav_change_pct and mv:
-                pnl = mv * fund.nav_change_pct / Decimal("100")
+                pnl = mv * fund.nav_change_pct / (Decimal("100") + fund.nav_change_pct)
                 daily_pnl += pnl
 
             fund_codes.add(holding.fund_code)
@@ -88,7 +90,7 @@ class DashboardService:
 
             pnl = Decimal("0")
             if fund and fund.nav_change_pct and mv:
-                pnl = mv * fund.nav_change_pct / Decimal("100")
+                pnl = mv * fund.nav_change_pct / (Decimal("100") + fund.nav_change_pct)
 
             entry = platform_map.setdefault(holding.platform, {
                 "market_value": Decimal("0"),

@@ -14,13 +14,16 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
+# Time after which today's NAV is expected to be available (24h format)
+NAV_AVAILABLE_HOUR = 20
+
 
 async def job_refresh_nav():
     """Fetch latest NAV for all held funds (workday 20:00)."""
     logger.info("Scheduled job: refreshing NAV for all funds")
     db = SessionLocal()
     try:
-        result = await NavService(db).refresh_all_nav()
+        result = await NavService(db).refresh_all_nav_smart()
         logger.info(f"NAV refresh result: {result}")
     except Exception as e:
         logger.error(f"NAV refresh failed: {e}")
@@ -33,7 +36,7 @@ async def job_retry_nav():
     logger.info("Scheduled job: retrying NAV for missing funds")
     db = SessionLocal()
     try:
-        result = await NavService(db).refresh_all_nav()
+        result = await NavService(db).refresh_all_nav_smart()
         logger.info(f"NAV retry result: {result}")
     except Exception as e:
         logger.error(f"NAV retry failed: {e}")
@@ -54,21 +57,47 @@ async def job_daily_snapshot():
         db.close()
 
 
-async def job_startup_backfill():
-    """Check and backfill missed NAV data on startup."""
-    logger.info("Startup job: checking for missed NAV data")
+async def job_startup_nav_check():
+    """On startup: fetch NAV data intelligently.
+
+    Logic:
+    1. If any active fund has no NAV data at all → fetch regardless of time/weekday.
+    2. Otherwise, use smart refresh:
+       - Fetch latest trading day NAV first (highest priority)
+       - Background task will fill in any missing dates
+    """
+    now = datetime.now()
+    today = now.date()
+
     db = SessionLocal()
     try:
         svc = NavService(db)
+
+        # Step 1: funds completely missing NAV data (no history at all)
         status = svc.get_nav_status()
         if status["funds_missing_nav"] > 0:
-            logger.info(f"Backfilling NAV for {status['funds_missing_nav']} funds")
-            result = await svc.refresh_all_nav()
-            logger.info(f"Startup backfill result: {result}")
+            logger.info(
+                f"Startup NAV check: {status['funds_missing_nav']} fund(s) have no NAV "
+                "data at all, fetching now..."
+            )
+            result = await svc.refresh_all_nav_smart()
+            logger.info(f"Startup NAV fetch result: {result}")
+            return
+
+        # Step 2: smart refresh - get latest trading day and backfill missing dates
+        latest_trading = svc.get_latest_trading_date()
+        if latest_trading:
+            logger.info(
+                f"Startup NAV check: latest trading day is {latest_trading}, "
+                "using smart refresh to get latest NAV and backfill missing dates..."
+            )
+            result = await svc.refresh_all_nav_smart()
+            logger.info(f"Startup NAV smart refresh result: {result}")
         else:
-            logger.info("All funds have NAV data, no backfill needed")
+            logger.info("Startup NAV check: no trading data found, skipping")
+
     except Exception as e:
-        logger.error(f"Startup backfill failed: {e}")
+        logger.error(f"Startup NAV check failed: {e}")
     finally:
         db.close()
 

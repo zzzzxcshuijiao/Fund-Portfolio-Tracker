@@ -11,10 +11,15 @@ router = APIRouter()
 
 
 @router.post("/upload", response_model=ImportResult)
-async def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Upload and import fund holdings Excel file."""
+async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Upload and import fund holdings file.
+
+    Accepts:
+    - Excel files (.xlsx, .xls): Single file import
+    - ZIP files: May contain multiple Excel files to import in batch
+    """
     from backend.services.import_service import ImportService
-    return await ImportService(db).import_excel(file)
+    return await ImportService(db).import_file(file)
 
 
 @router.get("/history", response_model=list[ImportHistoryItem])

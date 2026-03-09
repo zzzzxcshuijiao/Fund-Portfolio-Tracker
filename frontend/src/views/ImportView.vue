@@ -15,17 +15,17 @@
         action=""
         :auto-upload="false"
         :limit="1"
-        accept=".xlsx,.xls"
+        accept=".xlsx,.xls,.zip"
         :on-change="handleFileChange"
         :on-exceed="handleExceed"
       >
         <el-icon class="el-icon--upload"><UploadFilled /></el-icon>
         <div class="el-upload__text">
-          将基金E账户导出的 Excel 文件拖到此处，或 <em>点击上传</em>
+          将基金E账户导出的 Excel 或 ZIP 文件拖到此处，或 <em>点击上传</em>
         </div>
         <template #tip>
           <div class="el-upload__tip">
-            支持 .xlsx 格式，文件来源：基金E账户App → 投资者公募基金持有信息
+            支持 .xlsx、.xls 或 .zip 格式（ZIP可包含多个Excel文件）。文件来源：基金E账户App → 投资者公募基金持有信息
           </div>
         </template>
       </el-upload>
@@ -49,7 +49,7 @@
         <span>导入结果</span>
       </template>
       <el-result
-        :icon="importResult.status === 'success' ? 'success' : importResult.status === 'duplicate' ? 'warning' : 'error'"
+        :icon="resultIcon"
         :title="resultTitle"
         :sub-title="importResult.error_message || ''"
       >
@@ -93,7 +93,7 @@
         <el-table-column prop="updated_holdings" label="更新" width="70" align="center" />
         <el-table-column prop="status" label="状态" width="100" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.status === 'success' ? 'success' : row.status === 'duplicate' ? 'warning' : 'danger'" size="small">
+            <el-tag :type="statusTagType(row.status)" size="small">
               {{ statusLabel(row.status) }}
             </el-tag>
           </template>
@@ -101,7 +101,7 @@
         <el-table-column label="操作" width="120" align="center">
           <template #default="{ row }">
             <el-button
-              v-if="row.status === 'success'"
+              v-if="row.status === 'success' || row.status === 'partial'"
               type="primary"
               link
               size="small"
@@ -171,12 +171,27 @@ const resultTitle = computed(() => {
   const s = importResult.value.status
   if (s === 'success') return '导入成功'
   if (s === 'duplicate') return '文件已导入过'
+  if (s === 'partial') return '部分成功'
   return '导入失败'
 })
 
+const resultIcon = computed(() => {
+  if (!importResult.value) return 'error'
+  const s = importResult.value.status
+  if (s === 'success') return 'success'
+  if (s === 'duplicate') return 'warning'
+  if (s === 'partial') return 'warning'
+  return 'error'
+})
+
 function statusLabel(status) {
-  const map = { success: '成功', duplicate: '重复', error: '失败' }
+  const map = { success: '成功', duplicate: '重复', partial: '部分成功', error: '失败' }
   return map[status] ?? status
+}
+
+function statusTagType(status) {
+  const map = { success: 'success', duplicate: 'warning', partial: 'warning', error: 'danger' }
+  return map[status] ?? 'info'
 }
 
 function changeTypeLabel(type) {
@@ -216,6 +231,12 @@ async function handleUpload() {
     if (importResult.value.status === 'success') {
       ElMessage.success('导入成功')
       // Auto-show changes if present
+      if (importResult.value.changes?.length) {
+        changesData.value = importResult.value.changes
+        changesDialogVisible.value = true
+      }
+    } else if (importResult.value.status === 'partial') {
+      ElMessage.warning('部分文件导入成功，请查看详细信息')
       if (importResult.value.changes?.length) {
         changesData.value = importResult.value.changes
         changesDialogVisible.value = true

@@ -79,7 +79,10 @@
               @click="cell.day ? selectDate(cell) : null"
             >
               <template v-if="cell.day">
-                <div class="day-number">{{ cell.day }}</div>
+                <div class="day-number">
+                  {{ cell.day }}
+                  <span v-if="cell.hasTrade" class="trade-badge">调仓</span>
+                </div>
                 <div v-if="cell.mv !== null" class="day-mv">{{ formatMv(cell.mv) }}</div>
                 <div v-if="cell.pnl !== null" class="day-pnl" :class="pnlClass(cell.pnl)">
                   {{ formatCompact(cell.pnl) }}
@@ -94,49 +97,187 @@
     <!-- Day detail panel -->
     <el-card v-if="selectedDate" shadow="hover" class="detail-card">
       <template #header>
-        <span>{{ selectedDate }} 基金收益明细</span>
+        <span>{{ selectedDate }} 当日详情</span>
       </template>
-      <el-table
-        v-loading="detailLoading"
-        :data="dayDetails"
-        stripe
-        size="small"
-        :default-sort="{ prop: 'daily_pnl', order: 'descending' }"
-      >
-        <el-table-column prop="fund_code" label="代码" width="90" />
-        <el-table-column prop="fund_name" label="名称" min-width="180" show-overflow-tooltip />
-        <el-table-column prop="platform" label="平台" width="100" show-overflow-tooltip />
-        <el-table-column prop="shares" label="份额" width="110" align="right">
-          <template #default="{ row }">{{ formatNum(row.shares) }}</template>
-        </el-table-column>
-        <el-table-column prop="prev_nav" label="前日净值" width="100" align="right">
-          <template #default="{ row }">{{ row.prev_nav ?? '-' }}</template>
-        </el-table-column>
-        <el-table-column prop="nav" label="当日净值" width="100" align="right">
-          <template #default="{ row }">{{ row.nav ?? '-' }}</template>
-        </el-table-column>
-        <el-table-column prop="daily_pnl" label="盈亏" width="120" align="right" sortable>
-          <template #default="{ row }">
-            <span v-if="row.daily_pnl !== null" :class="pnlClass(row.daily_pnl)">
-              {{ formatMoney(row.daily_pnl) }}
+
+      <div v-if="detailLoading" style="padding: 16px">
+        <el-skeleton :rows="6" animated />
+      </div>
+
+      <template v-else-if="dayDetail">
+        <!-- 1. Total summary bar -->
+        <div class="day-summary-bar">
+          <div class="summary-stat">
+            <span class="stat-label">总资产</span>
+            <span class="stat-value">¥{{ formatNum(dayDetail.summary.total_market_value) }}</span>
+          </div>
+          <div class="summary-stat" v-if="dayDetail.summary.total_daily_pnl != null">
+            <span class="stat-label">当日盈亏</span>
+            <span class="stat-value" :class="pnlClass(dayDetail.summary.total_daily_pnl)">
+              {{ formatMoney(dayDetail.summary.total_daily_pnl) }}
             </span>
-            <span v-else>-</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="daily_pnl_pct" label="涨跌幅" width="100" align="right" sortable>
-          <template #default="{ row }">
-            <span v-if="row.daily_pnl_pct !== null" :class="pnlClass(row.daily_pnl_pct)">
-              {{ row.daily_pnl_pct > 0 ? '+' : '' }}{{ row.daily_pnl_pct }}%
+          </div>
+          <div class="summary-stat" v-if="dayDetail.summary.daily_pnl_pct != null">
+            <span class="stat-label">盈亏率</span>
+            <span class="stat-value" :class="pnlClass(dayDetail.summary.daily_pnl_pct)">
+              {{ dayDetail.summary.daily_pnl_pct > 0 ? '+' : '' }}{{ dayDetail.summary.daily_pnl_pct }}%
             </span>
-            <span v-else>-</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="market_value" label="市值" width="120" align="right">
-          <template #default="{ row }">
-            {{ row.market_value ? formatMoney(row.market_value) : '-' }}
-          </template>
-        </el-table-column>
-      </el-table>
+          </div>
+        </div>
+
+        <!-- 2. Per-platform assets -->
+        <div class="section-header">各平台资产</div>
+        <div class="account-cards">
+          <div
+            v-for="acct in dayDetail.accounts"
+            :key="acct.platform"
+            class="account-card"
+          >
+            <div class="acct-platform">{{ acct.platform || '其他' }}</div>
+            <div class="acct-mv">¥{{ formatNum(acct.market_value) }}</div>
+            <div v-if="acct.daily_pnl != null" class="acct-pnl" :class="pnlClass(acct.daily_pnl)">
+              {{ formatMoney(acct.daily_pnl) }}
+            </div>
+          </div>
+        </div>
+
+        <!-- 3. Trade changes (only shown when there are trades) -->
+        <template v-if="dayDetail.trades && dayDetail.trades.length > 0">
+          <div class="section-header">调仓明细</div>
+          <el-table :data="dayDetail.trades" size="small" stripe>
+            <el-table-column prop="platform" label="平台" width="100" show-overflow-tooltip />
+            <el-table-column prop="fund_account" label="账户" width="120" show-overflow-tooltip />
+            <el-table-column prop="fund_code" label="代码" width="90" />
+            <el-table-column prop="fund_name" label="名称" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="change_type" label="操作" width="72" align="center">
+              <template #default="{ row }">
+                <el-tag :type="tradeTagType(row.change_type)" size="small">
+                  {{ tradeLabel(row.change_type) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="份额变动" width="160" align="right">
+              <template #default="{ row }">
+                <span class="shares-change">
+                  {{ row.shares_before != null ? formatNum(row.shares_before) : '-' }}
+                  →
+                  {{ row.shares_after != null ? formatNum(row.shares_after) : '-' }}
+                </span>
+                <span
+                  v-if="row.shares_delta != null"
+                  :class="row.shares_delta > 0 ? 'pnl-positive' : 'pnl-negative'"
+                  style="margin-left: 4px; font-size: 12px"
+                >
+                  ({{ row.shares_delta > 0 ? '+' : '' }}{{ formatNum(row.shares_delta) }})
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="nav_at_change" label="净值" width="90" align="right">
+              <template #default="{ row }">{{ row.nav_at_change ?? '-' }}</template>
+            </el-table-column>
+            <el-table-column label="市值变动" min-width="160" align="right">
+              <template #default="{ row }">
+                {{ row.mv_before != null ? '¥' + formatNum(row.mv_before) : '-' }}
+                →
+                {{ row.mv_after != null ? '¥' + formatNum(row.mv_after) : '-' }}
+              </template>
+            </el-table-column>
+          </el-table>
+        </template>
+
+        <!-- 4. Per-holding PnL -->
+        <div class="section-header">持仓盈亏</div>
+
+        <!-- NAV mismatch warning -->
+        <el-alert
+          v-if="navMismatchCount > 0"
+          :title="`${navMismatchCount} 支基金的导入净值与接口净值不一致，请检查`"
+          type="warning"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 8px"
+        />
+
+        <el-table
+          :data="dayDetail.holdings"
+          stripe
+          size="small"
+          :default-sort="{ prop: 'daily_pnl', order: 'descending' }"
+          :row-class-name="holdingRowClass"
+        >
+          <el-table-column prop="platform" label="平台" width="100" show-overflow-tooltip />
+          <el-table-column prop="fund_account" label="账户" width="120" show-overflow-tooltip />
+          <el-table-column prop="fund_code" label="代码" width="90" />
+          <el-table-column prop="fund_name" label="名称" min-width="150" show-overflow-tooltip />
+          <el-table-column prop="shares" label="份额" width="110" align="right">
+            <template #default="{ row }">{{ formatNum(row.shares) }}</template>
+          </el-table-column>
+          <el-table-column prop="prev_nav" label="前日净值" width="90" align="right">
+            <template #default="{ row }">{{ row.prev_nav ?? '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="nav" label="接口净值" width="110" align="right">
+            <template #default="{ row }">
+              <span v-if="row.nav !== null && row.nav !== undefined">
+                {{ row.nav }}
+                <el-tooltip
+                  v-if="!row.nav_date"
+                  content="API 无净值数据，使用导入净值估算市值（无日收益）"
+                  placement="top"
+                >
+                  <el-tag type="info" size="small" style="margin-left: 4px; cursor: help">估</el-tag>
+                </el-tooltip>
+                <el-tooltip
+                  v-else-if="row.nav_date !== selectedDate"
+                  :content="`净值来自 ${row.nav_date}（非当日数据，请回填历史净值）`"
+                  placement="top"
+                >
+                  <el-tag type="warning" size="small" style="margin-left: 4px; cursor: help">{{ row.nav_date.slice(5) }}</el-tag>
+                </el-tooltip>
+              </span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="导入净值" width="120" align="right">
+            <template #default="{ row }">
+              <template v-if="row.import_nav != null">
+                <span>{{ row.import_nav }}</span>
+                <el-tooltip
+                  v-if="row.nav_mismatch === true"
+                  :content="`不一致：接口 ${row.nav} vs 导入 ${row.import_nav}`"
+                  placement="top"
+                >
+                  <el-tag type="danger" size="small" style="margin-left: 4px; cursor: help">不符</el-tag>
+                </el-tooltip>
+                <el-tooltip v-else-if="row.nav_mismatch === false" content="与接口净值一致" placement="top">
+                  <el-tag type="success" size="small" style="margin-left: 4px; cursor: help">✓</el-tag>
+                </el-tooltip>
+              </template>
+              <span v-else style="color: #c0c4cc">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="daily_pnl" label="盈亏" width="110" align="right" sortable>
+            <template #default="{ row }">
+              <span v-if="row.daily_pnl !== null" :class="pnlClass(row.daily_pnl)">
+                {{ formatMoney(row.daily_pnl) }}
+              </span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="daily_pnl_pct" label="涨跌幅" width="90" align="right" sortable>
+            <template #default="{ row }">
+              <span v-if="row.daily_pnl_pct !== null" :class="pnlClass(row.daily_pnl_pct)">
+                {{ row.daily_pnl_pct > 0 ? '+' : '' }}{{ row.daily_pnl_pct }}%
+              </span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="market_value" label="市值" width="110" align="right">
+            <template #default="{ row }">
+              {{ row.market_value ? formatMoney(row.market_value) : '-' }}
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
     </el-card>
   </div>
 </template>
@@ -157,7 +298,16 @@ const data = ref(null)
 
 const selectedDate = ref(null)
 const detailLoading = ref(false)
-const dayDetails = ref([])
+const dayDetail = ref(null)
+
+// Trade dates: Set of "YYYY-MM-DD" where non-money-fund shares changed
+const tradeDatesSet = computed(() => {
+  const s = new Set()
+  if (data.value?.trade_dates) {
+    for (const d of data.value.trade_dates) s.add(d)
+  }
+  return s
+})
 
 // Build a map for quick lookup: "YYYY-MM-DD" -> day data
 const pnlMap = computed(() => {
@@ -206,6 +356,7 @@ const calendarCells = computed(() => {
       pnlPct: dayData?.daily_pnl_pct != null ? Number(dayData.daily_pnl_pct) : null,
       mv: dayData?.market_value != null ? Number(dayData.market_value) : null,
       isTrading: !!dayData,
+      hasTrade: tradeDatesSet.value.has(dateStr),
     })
   }
 
@@ -231,9 +382,9 @@ async function fetchMonth() {
 async function fetchDayDetail(dateStr) {
   detailLoading.value = true
   try {
-    dayDetails.value = await getCalendarDayDetail(dateStr)
+    dayDetail.value = await getCalendarDayDetail(dateStr)
   } catch {
-    dayDetails.value = []
+    dayDetail.value = null
   } finally {
     detailLoading.value = false
   }
@@ -272,11 +423,13 @@ function goToday() {
 // Watch month/year changes
 watch([year, month], () => {
   selectedDate.value = null
-  dayDetails.value = []
+  dayDetail.value = null
   fetchMonth()
 })
 
-onMounted(fetchMonth)
+onMounted(() => {
+  fetchMonth()
+})
 
 // --- Formatters ---
 
@@ -292,6 +445,7 @@ function cellClass(cell) {
   if (!cell.day) return 'empty-cell'
   const classes = ['has-day']
   if (cell.dateStr === selectedDate.value) classes.push('selected')
+  if (cell.hasTrade) classes.push('trade-day')
   if (cell.isTrading) {
     classes.push('trading-day')
     if (cell.pnl !== null) {
@@ -332,6 +486,27 @@ function formatMv(val) {
 function formatNum(val) {
   if (val == null) return '-'
   return Number(val).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
+const TRADE_LABELS = { new: '新建', increase: '买入', decrease: '卖出', clear: '清仓' }
+const TRADE_TAG_TYPES = { new: 'success', increase: 'primary', decrease: 'warning', clear: 'danger' }
+
+function tradeLabel(type) {
+  return TRADE_LABELS[type] ?? type
+}
+
+function tradeTagType(type) {
+  return TRADE_TAG_TYPES[type] ?? 'info'
+}
+
+// Count holdings with NAV mismatch for the warning banner
+const navMismatchCount = computed(() => {
+  if (!dayDetail.value?.holdings) return 0
+  return dayDetail.value.holdings.filter(h => h.nav_mismatch === true).length
+})
+
+function holdingRowClass({ row }) {
+  return row.nav_mismatch === true ? 'row-mismatch' : ''
 }
 </script>
 
@@ -467,10 +642,29 @@ function formatNum(val) {
 }
 
 .day-number {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: 14px;
   font-weight: 500;
   color: #303133;
   margin-bottom: 2px;
+}
+
+.trade-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: #409eff;
+  color: #fff;
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 16px;
+  letter-spacing: 0.5px;
+  flex-shrink: 0;
+}
+
+.trade-day {
+  box-shadow: inset 3px 0 0 #409eff;
 }
 
 .day-mv {
@@ -496,5 +690,87 @@ function formatNum(val) {
 /* Detail card */
 .detail-card {
   margin-top: 16px;
+}
+
+/* Total summary bar */
+.day-summary-bar {
+  display: flex;
+  gap: 32px;
+  align-items: center;
+  padding: 12px 16px;
+  background: #f5f7fa;
+  border-radius: 6px;
+  margin-bottom: 20px;
+}
+
+.summary-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: #909399;
+}
+
+.stat-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: #303133;
+}
+
+/* Section headers */
+.section-header {
+  font-size: 14px;
+  font-weight: 600;
+  color: #606266;
+  margin: 16px 0 8px;
+  padding-left: 8px;
+  border-left: 3px solid #409eff;
+}
+
+/* Account cards */
+.account-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.account-card {
+  min-width: 140px;
+  padding: 10px 14px;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.acct-platform {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 6px;
+}
+
+.acct-mv {
+  font-size: 15px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.acct-pnl {
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* Trade table helpers */
+.shares-change {
+  color: #606266;
+}
+
+/* Mismatch row highlight */
+:deep(.row-mismatch) {
+  background-color: #fff5f5 !important;
 }
 </style>

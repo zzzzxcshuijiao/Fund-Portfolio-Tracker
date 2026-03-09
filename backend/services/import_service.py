@@ -2,8 +2,10 @@
 
 import os
 import shutil
+import zipfile
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
@@ -27,6 +29,256 @@ UPLOAD_DIR = Path("data/uploads")
 class ImportService:
     def __init__(self, db: Session):
         self.db = db
+
+    def _detect_file_type(self, filename: str) -> str:
+        """Detect file type from extension."""
+        ext = Path(filename).suffix.lower()
+        if ext == ".zip":
+            return "zip"
+        elif ext in (".xlsx", ".xls"):
+            return "excel"
+        else:
+            return "unknown"
+
+    async def import_file(self, file: UploadFile) -> ImportResult:
+        """Import file - auto-detects type (Excel or ZIP)."""
+        file_type = self._detect_file_type(file.filename)
+
+        if file_type == "zip":
+            return await self.import_zip(file)
+        elif file_type == "excel":
+            return await self.import_excel(file)
+        else:
+            return ImportResult(
+                import_id=0,
+                file_name=file.filename,
+                status="error",
+                error_message=f"不支持的文件类型，请上传 .xlsx, .xls 或 .zip 文件",
+            )
+
+    async def import_zip(self, file: UploadFile) -> ImportResult:
+        """Upload ZIP file, extract Excels, and import all."""
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Save uploaded ZIP
+        zip_path = UPLOAD_DIR / file.filename
+        with open(zip_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        # Compute hash for duplicate detection
+        zip_hash = compute_file_hash(zip_path)
+
+        # Check for duplicate import (look for ZIP summary record by file_name)
+        existing = self.db.execute(
+            select(ImportRecord).where(
+                ImportRecord.file_hash == zip_hash,
+                ImportRecord.file_name == file.filename
+            )
+        ).scalars().first()
+        if existing:
+            os.remove(zip_path)
+            return ImportResult(
+                import_id=existing.id,
+                file_name=file.filename,
+                total_rows=existing.total_rows,
+                new_holdings=existing.new_holdings,
+                updated_holdings=existing.updated_holdings,
+                removed_holdings=existing.removed_holdings,
+                error_rows=existing.error_rows,
+                data_date=existing.data_date,
+                status="duplicate",
+                error_message="该文件已导入过",
+            )
+
+        # Create temp directory for extraction
+        temp_dir = UPLOAD_DIR / f"temp_{zip_path.stem}"
+        temp_dir.mkdir(exist_ok=True)
+
+        try:
+            # Extract ZIP
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(temp_dir)
+
+            # Find all Excel files
+            excel_files = []
+            for ext in ("*.xlsx", "*.xls"):
+                excel_files.extend(temp_dir.glob(ext))
+                # Also search subdirectories
+                excel_files.extend(temp_dir.rglob(ext))
+
+            if not excel_files:
+                os.remove(zip_path)
+                shutil.rmtree(temp_dir)
+                return ImportResult(
+                    import_id=0,
+                    file_name=file.filename,
+                    status="error",
+                    error_message="ZIP文件中未找到Excel文件",
+                )
+
+            # Import each Excel file
+            total_new = 0
+            total_updated = 0
+            total_removed = 0
+            total_errors = 0
+            all_changes: list[HoldingChange] = []
+            combined_data_date: Optional[date] = None
+            import_errors: list[str] = []
+
+            for excel_path in excel_files:
+                try:
+                    result = await self._import_excel_from_path(
+                        excel_path, file.filename, zip_hash, skip_duplicate_check=True
+                    )
+                    if result.status == "success":
+                        total_new += result.new_holdings
+                        total_updated += result.updated_holdings
+                        total_removed += result.removed_holdings
+                        total_errors += result.error_rows
+                        # Get changes for this import (raw model objects)
+                        changes = self.db.execute(
+                            select(HoldingChange)
+                            .where(HoldingChange.import_id == result.import_id)
+                        ).scalars().all()
+                        all_changes.extend(changes)
+                        if result.data_date and combined_data_date is None:
+                            combined_data_date = result.data_date
+                    else:
+                        import_errors.append(f"{excel_path.name}: {result.error_message}")
+                except Exception as e:
+                    import_errors.append(f"{excel_path.name}: {str(e)}")
+
+            # Create summary record
+            record = ImportRecord(
+                file_name=file.filename,
+                file_hash=zip_hash,
+                total_rows=total_new + total_updated,
+                new_holdings=total_new,
+                updated_holdings=total_updated,
+                removed_holdings=total_removed,
+                error_rows=total_errors,
+                data_date=combined_data_date,
+                status="success" if not import_errors else "partial",
+                error_message="; ".join(import_errors[:5]) if import_errors else None,
+            )
+            self.db.add(record)
+            self.db.commit()
+            self.db.refresh(record)
+
+            # Build change responses
+            change_responses = [
+                HoldingChangeResponse.model_validate(c) for c in all_changes[:100]
+            ]
+
+            return ImportResult(
+                import_id=record.id,
+                file_name=file.filename,
+                total_rows=record.total_rows,
+                new_holdings=total_new,
+                updated_holdings=total_updated,
+                removed_holdings=total_removed,
+                error_rows=total_errors,
+                data_date=combined_data_date,
+                status=record.status,
+                error_message=record.error_message,
+                changes=change_responses,
+            )
+
+        except zipfile.BadZipFile:
+            os.remove(zip_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return ImportResult(
+                import_id=0,
+                file_name=file.filename,
+                status="error",
+                error_message="ZIP文件格式错误或已损坏",
+            )
+        except Exception as e:
+            os.remove(zip_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return ImportResult(
+                import_id=0,
+                file_name=file.filename,
+                status="error",
+                error_message=f"处理ZIP文件时出错: {str(e)}",
+            )
+        finally:
+            # Cleanup temp directory
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            # Remove uploaded ZIP
+            if zip_path.exists():
+                os.remove(zip_path)
+
+    async def _import_excel_from_path(
+        self,
+        excel_path: Path,
+        original_filename: str,
+        file_hash: str,
+        skip_duplicate_check: bool = False,
+    ) -> ImportResult:
+        """Import Excel from a file path (used by ZIP import)."""
+        # Parse Excel
+        try:
+            holdings, errors, data_date = parse_excel(excel_path)
+        except ExcelParseError as e:
+            record = ImportRecord(
+                file_name=excel_path.name,
+                file_hash=file_hash,
+                status="error",
+                error_message=str(e),
+            )
+            self.db.add(record)
+            self.db.commit()
+            self.db.refresh(record)
+            return ImportResult(
+                import_id=record.id,
+                file_name=excel_path.name,
+                status="error",
+                error_message=str(e),
+            )
+
+        # Create import record
+        record = ImportRecord(
+            file_name=excel_path.name,
+            file_hash=file_hash,
+            total_rows=len(holdings),
+            error_rows=len(errors),
+            data_date=data_date,
+        )
+        self.db.add(record)
+        self.db.flush()
+
+        # Merge holdings
+        new_count, updated_count, removed_count, changes = self._merge_holdings(
+            holdings, record.id
+        )
+
+        record.new_holdings = new_count
+        record.updated_holdings = updated_count
+        record.removed_holdings = removed_count
+        record.status = "success"
+        if errors:
+            record.error_message = "; ".join(
+                f"行{e['row']}: {e['message']}" for e in errors[:10]
+            )
+
+        self.db.commit()
+        self.db.refresh(record)
+
+        return ImportResult(
+            import_id=record.id,
+            file_name=excel_path.name,
+            total_rows=record.total_rows,
+            new_holdings=new_count,
+            updated_holdings=updated_count,
+            removed_holdings=removed_count,
+            error_rows=len(errors),
+            data_date=data_date,
+            status=record.status,
+            error_message=record.error_message,
+        )
 
     async def import_excel(self, file: UploadFile) -> ImportResult:
         """Upload Excel file, parse, and merge holdings into database."""
@@ -271,6 +523,7 @@ class ImportService:
                 old_shares = holding.shares or Decimal("0")
                 old_mv = holding.market_value or Decimal("0")
                 holding.status = 0
+                holding.shares = Decimal("0")  # zero out shares on clear
                 removed_count += 1
 
                 change = HoldingChange(

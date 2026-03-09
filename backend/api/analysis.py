@@ -13,7 +13,7 @@ from backend.schemas.holding_daily_pnl import (
 )
 from backend.schemas.calendar import (
     CalendarMonthResponse,
-    CalendarDayDetail,
+    CalendarDayResponse,
 )
 
 router = APIRouter()
@@ -59,11 +59,11 @@ def get_calendar_month(
     return CalendarService(db).get_monthly_pnl(year, month)
 
 
-@router.get("/calendar/{target_date}/detail", response_model=list[CalendarDayDetail])
+@router.get("/calendar/{target_date}/detail", response_model=CalendarDayResponse)
 def get_calendar_day_detail(
     target_date: date = Path(..., description="Date in YYYY-MM-DD format"),
     db: Session = Depends(get_db),
 ):
-    """Get per-fund PnL detail for a specific day."""
+    """Get full day detail: summary, per-account assets, trades, per-holding PnL."""
     from backend.services.calendar_service import CalendarService
     return CalendarService(db).get_day_detail(target_date)

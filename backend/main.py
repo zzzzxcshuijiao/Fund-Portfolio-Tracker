@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import get_settings
 from backend.database import engine, Base
 from backend.api.router import api_router
-from backend.scheduler.jobs import setup_scheduler, job_startup_backfill
+from backend.scheduler.jobs import setup_scheduler, job_startup_nav_check
 
 # Configure logging
 logging.basicConfig(
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler started")
 
     # Startup backfill (run in background)
-    asyncio.create_task(job_startup_backfill())
+    asyncio.create_task(job_startup_nav_check())
 
     yield
 

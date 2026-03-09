@@ -1,10 +1,11 @@
 """NAV service - business logic for NAV updates."""
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, func, distinct
+from sqlalchemy import select, func, distinct, case
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
@@ -194,6 +195,22 @@ class NavService:
             for r in records
         ]
 
+    def has_today_nav(self, today: date) -> bool:
+        """Return True if all active funds already have NAV data for today."""
+        fund_codes = self.get_held_fund_codes()
+        if not fund_codes:
+            return True
+
+        count_today = self.db.execute(
+            select(func.count(distinct(FundNavHistory.fund_code)))
+            .where(
+                FundNavHistory.fund_code.in_(fund_codes),
+                FundNavHistory.nav_date == today,
+            )
+        ).scalar() or 0
+
+        return count_today >= len(fund_codes)
+
     def get_nav_status(self) -> dict:
         """Get latest NAV update status."""
         # Get the latest NAV date across all funds
@@ -218,3 +235,198 @@ class NavService:
             "funds_with_nav": funds_with_nav or 0,
             "funds_missing_nav": (total_funds or 0) - (funds_with_nav or 0),
         }
+
+    def get_latest_trading_date(self) -> date | None:
+        """获取数据库中最新的交易日（有NAV数据的日期）。
+
+        返回所有基金中最新的 nav_date。
+        """
+        return self.db.execute(
+            select(func.max(FundNavHistory.nav_date))
+        ).scalar()
+
+    def get_missing_date_range(
+        self, from_date: date | None, to_date: date | None
+    ) -> list[date]:
+        """获取指定日期范围内缺失的交易日列表。
+
+        一个日期被认为是"缺失的"，如果：
+        - 任何持仓基金在该日期没有 NAV 数据
+
+        Args:
+            from_date: 起始日期（包含），如果为 None 则使用最早的 NAV 日期
+            to_date: 结束日期（包含），如果为 None 则返回所有缺失日期
+
+        Returns:
+            缺失的交易日列表，按时间顺序排列
+        """
+        if to_date is None:
+            to_date = date.today()
+
+        # 确定起始日期
+        if from_date is None:
+            # 使用最早的 NAV 日期
+            earliest = self.db.execute(
+                select(func.min(FundNavHistory.nav_date))
+            ).scalar()
+            if earliest is None:
+                return []
+            from_date = earliest
+
+        fund_codes = self.get_held_fund_codes()
+        if not fund_codes:
+            return []
+
+        # 查询在指定日期范围内有 NAV 数据的日期
+        existing_dates = self.db.execute(
+            select(distinct(FundNavHistory.nav_date))
+            .where(
+                FundNavHistory.fund_code.in_(fund_codes),
+                FundNavHistory.nav_date >= from_date,
+                FundNavHistory.nav_date <= to_date,
+            )
+        ).scalars().all()
+
+        existing_set = set(existing_dates)
+
+        # 找出缺失的日期：在 from_date 到 to_date 之间的工作日
+        missing = []
+        current = from_date
+        while current <= to_date:
+            # 只考虑工作日（周一到周五）
+            if current.weekday() < 5:  # 0-4 是周一到周五
+                if current not in existing_set:
+                    missing.append(current)
+            current += timedelta(days=1)
+
+        return missing
+
+    async def refresh_all_nav_smart(self) -> dict:
+        """智能刷新所有持仓基金的净值数据。
+
+        策略：
+        1. 首先获取最新交易日的净值（优先级最高）
+        2. 然后后台异步获取从上次更新到最新交易日之间缺失的日期
+
+        Returns:
+            包含更新状态的字典
+        """
+        settings = get_settings()
+        fund_codes = self.get_held_fund_codes()
+        if not fund_codes:
+            return {"status": "no_holdings", "message": "没有持仓基金"}
+
+        # Step 1: 获取最新交易日的净值（优先）
+        logger.info("Step 1: Fetching latest trading day NAV...")
+        results = await batch_fetch_nav(
+            fund_codes,
+            concurrency=settings.NAV_FETCH_CONCURRENCY,
+            interval=settings.NAV_FETCH_INTERVAL,
+        )
+
+        updated = 0
+        failed = 0
+        for code, navs in results.items():
+            if navs and navs[0]:
+                nav = navs[0]
+                self._save_nav(nav)
+                self._update_fund_nav(nav)
+                updated += 1
+            else:
+                failed += 1
+
+        self._recalculate_market_values()
+        self.db.commit()
+
+        # Step 2: 找出缺失的日期范围并后台异步获取
+        latest_trading_date = self.get_latest_trading_date()
+        if latest_trading_date:
+            # 获取最新 NAV 日期（用于确定从哪天开始补）
+            latest_nav_in_db = self.db.execute(
+                select(func.max(Fund.latest_nav_date))
+            ).scalar()
+
+            if latest_nav_in_db and latest_nav_in_db < latest_trading_date:
+                # 有缺失日期，启动后台任务补全
+                missing_dates = self.get_missing_date_range(
+                    from_date=latest_nav_in_db + timedelta(days=1),
+                    to_date=latest_trading_date,
+                )
+                if missing_dates:
+                    logger.info(
+                        f"Step 2: Found {len(missing_dates)} missing dates, "
+                        f"starting backfill from {missing_dates[0]} to {missing_dates[-1]}"
+                    )
+                    # 启动后台任务（不等待完成）
+                    asyncio.create_task(
+                        self._backfill_missing_dates(missing_dates)
+                    )
+                    return {
+                        "status": "success",
+                        "total": len(fund_codes),
+                        "updated": updated,
+                        "failed": failed,
+                        "missing_dates_count": len(missing_dates),
+                        "backfill_started": True,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+
+        return {
+            "status": "success",
+            "total": len(fund_codes),
+            "updated": updated,
+            "failed": failed,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    async def _backfill_missing_dates(self, missing_dates: list[date]) -> None:
+        """后台任务：补全指定日期范围的净值数据。
+
+        Args:
+            missing_dates: 需要补全的日期列表
+        """
+        settings = get_settings()
+        fund_codes = self.get_held_fund_codes()
+
+        if not fund_codes or not missing_dates:
+            return
+
+        logger.info(f"Backfill task: processing {len(missing_dates)} dates...")
+
+        for target_date in missing_dates:
+            try:
+                # 按日期获取历史数据
+                date_str = str(target_date)
+                results = await batch_fetch_nav(
+                    fund_codes,
+                    concurrency=settings.NAV_FETCH_CONCURRENCY,
+                    interval=settings.NAV_FETCH_INTERVAL,
+                    start_date=date_str,
+                    end_date=date_str,
+                )
+
+                saved = 0
+                for code, navs in results.items():
+                    for nav in navs:
+                        self._save_nav(nav)
+                        saved += 1
+                    # 更新基金最新净值缓存（如果这个日期更新）
+                    if navs:
+                        self._update_fund_nav(navs[0])
+
+                if saved > 0:
+                    self.db.commit()
+                    logger.info(
+                        f"Backfill: {target_date} - saved {saved} NAV records"
+                    )
+                else:
+                    logger.info(f"Backfill: {target_date} - no data available")
+
+                # 短暂延迟，避免请求过快
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Backfill error for {target_date}: {e}")
+                self.db.rollback()
+
+        logger.info("Backfill task completed")
